@@ -74,6 +74,7 @@ type
     phase1ChainSafeChecked: bool
     phase1ChainSafe: bool
     phase1Fired: bool
+    phase1TooOldCanonicalSkip: bool
     phase1Inc: bool
     phase2: FcrRestartDiag
     phase2Inc: bool
@@ -219,6 +220,8 @@ proc emitFcrDiag(
   line.add " " & fcrBid("advance_after", advanceDiag.after)
   line.add " advance_p1_too_old=" & $advanceDiag.phase1TooOld
   line.add " advance_p1_confirmed_ancestor=" & $advanceDiag.phase1Ancestor
+  line.add " advance_p1_too_old_canonical_skip=" &
+    $advanceDiag.phase1TooOldCanonicalSkip
   line.add " advance_p1_fired=" & $advanceDiag.phase1Fired
   addRestart("advance", advanceDiag.phase2)
   line.add " advance_p3_gate=" & $advanceDiag.phase3Gate
@@ -718,8 +721,10 @@ proc advance_fcr(
   pathDiag.phase1Ancestor = fcrConfirmedAncestorOfHead(blckRef, confirmed)
   let revert = ? fcr.should_revert_confirmed_on_new_head(
     blckRef, confirmed, current_slot)
-  pathDiag.phase1Fired = revert
-  if revert:
+  pathDiag.phase1TooOldCanonicalSkip =
+    revert and pathDiag.phase1TooOld and pathDiag.phase1Ancestor
+  pathDiag.phase1Fired = revert and not pathDiag.phase1TooOldCanonicalSkip
+  if pathDiag.phase1Fired:
     reason = "head"
     confirmed = fcr.to_block_id(self.checkpoints.finalized)
     pathDiag.phase1Inc = true
