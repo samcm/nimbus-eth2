@@ -75,6 +75,7 @@ type
     phase1ChainSafe: bool
     phase1Fired: bool
     phase1TooOldCanonicalSkip: bool
+    phase1ChainSafeCanonicalSkip: bool
     phase1Inc: bool
     phase2: FcrRestartDiag
     phase2Inc: bool
@@ -209,9 +210,14 @@ proc emitFcrDiag(
   line.add " " & fcrBid("epoch_before", epochDiag.before)
   line.add " " & fcrBid("epoch_after", epochDiag.after)
   line.add " epoch_p1_too_old=" & $epochDiag.phase1TooOld
+  line.add " epoch_p1_confirmed_ancestor=" & $epochDiag.phase1Ancestor
+  line.add " epoch_p1_too_old_canonical_skip=" &
+    $epochDiag.phase1TooOldCanonicalSkip
   line.add " epoch_p1_chain_safe_checked=" &
     $epochDiag.phase1ChainSafeChecked
   line.add " epoch_p1_chain_safe=" & $epochDiag.phase1ChainSafe
+  line.add " epoch_p1_chain_safe_canonical_skip=" &
+    $epochDiag.phase1ChainSafeCanonicalSkip
   line.add " epoch_p1_fired=" & $epochDiag.phase1Fired
   addRestart("epoch", epochDiag.phase2)
 
@@ -420,14 +426,24 @@ proc reconfirm_fcr(
   # Reconfirm with previous balance source after attestations
   # from past slots have been applied
   self.process_attestation_queue(current_slot)
+  fcr.current_slot_head = ? fcr.find_head(current_slot, self.checkpoints)
+  let headRef = dag.getBlockRef(fcr.current_slot_head).valueOr:
+    return err ForkChoiceError(
+      kind: fcCurrentHeadUnknown,
+      blockRoot: fcr.current_slot_head)
   pathDiag.phase1TooOld = confirmed.slot.epoch + 1 < current_slot.epoch
+  pathDiag.phase1Ancestor = fcrConfirmedAncestorOfHead(headRef, confirmed)
   pathDiag.phase1ChainSafeChecked = not pathDiag.phase1TooOld
   let revert = ? fcr.should_revert_confirmed_on_new_epoch(
     dag, confirmed, current_slot, diag)
-  pathDiag.phase1Fired = revert
+  pathDiag.phase1TooOldCanonicalSkip =
+    revert and pathDiag.phase1TooOld and pathDiag.phase1Ancestor
+  pathDiag.phase1ChainSafeCanonicalSkip =
+    revert and pathDiag.phase1ChainSafeChecked and pathDiag.phase1Ancestor
+  pathDiag.phase1Fired = revert and not pathDiag.phase1Ancestor
   if pathDiag.phase1ChainSafeChecked:
     pathDiag.phase1ChainSafe = not revert
-  if revert:
+  if pathDiag.phase1Fired:
     reason = "epoch"
     confirmed = fcr.to_block_id(self.checkpoints.finalized)
     pathDiag.phase1Inc = true
@@ -437,7 +453,6 @@ proc reconfirm_fcr(
   self.update_unrealized_justified(dag)
 
   # Restart confirmation chain if necessary
-  fcr.current_slot_head = ? fcr.find_head(current_slot, self.checkpoints)
   pathDiag.phase2 = fcr.fcrRestartDiag(confirmed, current_slot)
   let restart = ? fcr.should_restart_confirmation_chain(confirmed, current_slot)
   pathDiag.phase2.result = restart
