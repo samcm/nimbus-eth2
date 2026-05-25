@@ -53,195 +53,11 @@ func find_head(
 
 logScope: topics = "fork_choice"
 
-type
-  FcrRestartDiag = object
-    attempted: bool
-    observedEpochOk: bool
-    headUnrealizedKnown: bool
-    checkpointEqual: bool
-    stale: bool
-    result: bool
-    observedBlockSlot: Slot
-    headUnrealized: Checkpoint
-
-  FcrPathDiag = object
-    ran: bool
-    error: bool
-    before: BlockId
-    after: BlockId
-    phase1TooOld: bool
-    phase1Ancestor: bool
-    phase1ChainSafeChecked: bool
-    phase1ChainSafe: bool
-    phase1Fired: bool
-    phase1TooOldCanonicalSkip: bool
-    phase1ChainSafeCanonicalSkip: bool
-    phase1Inc: bool
-    phase2: FcrRestartDiag
-    phase2Inc: bool
-    phase3Gate: bool
-    phase3Ran: bool
-    phase3Before: BlockId
-    phase3After: BlockId
-
-var
-  fcrDiagActive {.threadvar.}: bool
-  fcrDiagSimSlot {.threadvar.}: Slot
-  fcrDiagConfirmedBefore {.threadvar.}: BlockId
-  fcrDiagEpoch {.threadvar.}: FcrPathDiag
-
-func fcrShort(root: Eth2Digest): string =
-  "0x" & shortLog(root)
-
-func fcrBid(prefix: string, bid: BlockId): string =
-  prefix & "_slot=" & $bid.slot.uint64 &
-    " " & prefix & "_root=" & fcrShort(bid.root)
-
-func fcrCheckpointSlot(self: ForkChoiceBackend, checkpoint: Checkpoint): Slot =
-  self.proto_array.slot(checkpoint.root).valueOr:
-    checkpoint.epoch.start_slot
-
-func fcrCheckpoint(
-    self: ForkChoiceBackend, prefix: string, checkpoint: Checkpoint): string =
-  prefix & "_epoch=" & $checkpoint.epoch.uint64 &
-    " " & prefix & "_slot=" &
-      $self.fcrCheckpointSlot(checkpoint).uint64 &
-    " " & prefix & "_root=" & fcrShort(checkpoint.root)
-
 func fcrConfirmedAncestorOfHead(head: BlockRef, confirmed: BlockId): bool =
   var blck = head
   while blck != nil and blck.slot > confirmed.slot:
     blck = blck.parent
   blck != nil and blck.root == confirmed.root
-
-func fcrRestartDiag(
-    self: ForkChoiceBackend, confirmed: BlockId,
-    current_slot: Slot): FcrRestartDiag =
-  result.attempted = current_slot.is_epoch
-  result.observedBlockSlot =
-    self.current_epoch_observed_justified.info.block_slot
-  result.observedEpochOk =
-    result.observedBlockSlot.epoch + 1 == current_slot.epoch
-  let headUnrealized =
-    self.proto_array.unrealized_justified(self.current_slot_head)
-  result.headUnrealizedKnown = headUnrealized.isSome
-  if headUnrealized.isSome:
-    result.headUnrealized = headUnrealized.get
-    result.checkpointEqual =
-      self.current_epoch_observed_justified.checkpoint == result.headUnrealized
-  result.stale = confirmed.slot < result.observedBlockSlot
-  result.result = result.attempted and result.observedEpochOk and
-    result.headUnrealizedKnown and result.checkpointEqual and result.stale
-
-proc begin_fcr_diag*(self: var ForkChoice, simSlot: Slot) =
-  fcrDiagActive = true
-  fcrDiagSimSlot = simSlot
-  fcrDiagConfirmedBefore = self.backend.confirmed
-  fcrDiagEpoch = default(FcrPathDiag)
-
-proc fcrDiagWrite(line: string) {.gcsafe, raises: [].} =
-  try:
-    stderr.writeLine(line)
-  except IOError:
-    discard
-
-proc emitFcrDiag(
-    self: ForkChoice, current_slot: Slot, fallbackBefore: BlockId,
-    advanceDiag: FcrPathDiag, reason: string, errorInc: bool) =
-  let
-    simSlot =
-      if fcrDiagActive:
-        fcrDiagSimSlot
-      else:
-        if current_slot > GENESIS_SLOT: current_slot - 1 else: current_slot
-    before =
-      if fcrDiagActive:
-        fcrDiagConfirmedBefore
-      else:
-        fallbackBefore
-    finalized = self.checkpoints.finalized
-    justified = self.checkpoints.justified.checkpoint
-    observed = self.backend.current_epoch_observed_justified
-    greatestUnrealized =
-      self.backend.previous_epoch_greatest_unrealized_checkpoint
-    epochDiag = fcrDiagEpoch
-    incEpochRevert = epochDiag.phase1Inc
-    incHeadRevert = advanceDiag.phase1Inc
-    incRestart = epochDiag.phase2Inc or advanceDiag.phase2Inc
-
-  var line = "[fcr-diag]" &
-    " sim_slot=" & $simSlot.uint64 &
-    " current_slot=" & $current_slot.uint64 &
-    " " & fcrBid("confirmed_before_tick", before) &
-    " " & fcrBid("confirmed_after_tick", self.backend.confirmed) &
-    " " & self.backend.fcrCheckpoint("finalized", finalized) &
-    " " & self.backend.fcrCheckpoint("justified", justified) &
-    " observed_justified_epoch=" & $observed.checkpoint.epoch.uint64 &
-    " observed_justified_block_slot=" & $observed.info.block_slot.uint64 &
-    " observed_justified_root=" & fcrShort(observed.checkpoint.root) &
-    " " & self.backend.fcrCheckpoint(
-      "greatest_unrealized_justified", greatestUnrealized) &
-    " epoch_path_ran=" & $epochDiag.ran &
-    " advance_path_ran=" & $advanceDiag.ran &
-    " reason=" & reason &
-    " incSafeEpochReverts=" & $incEpochRevert &
-    " incSafeHeadReverts=" & $incHeadRevert &
-    " incSafeRestarts=" & $incRestart &
-    " incSafeErrors=" & $errorInc
-
-  template addRestart(prefix: string, restart: FcrRestartDiag) =
-    line.add " " & prefix & "_p2_attempted=" & $restart.attempted
-    line.add " " & prefix & "_p2_observed_epoch_ok=" &
-      $restart.observedEpochOk
-    line.add " " & prefix & "_p2_head_unrealized_known=" &
-      $restart.headUnrealizedKnown
-    line.add " " & prefix & "_p2_checkpoint_equal=" &
-      $restart.checkpointEqual
-    line.add " " & prefix & "_p2_confirmed_stale=" & $restart.stale
-    line.add " " & prefix & "_p2_result=" & $restart.result
-    line.add " " & prefix & "_p2_observed_block_slot=" &
-      $restart.observedBlockSlot.uint64
-    line.add " " & prefix & "_p2_head_unrealized_epoch=" &
-      $restart.headUnrealized.epoch.uint64
-    line.add " " & prefix & "_p2_head_unrealized_root=" &
-      fcrShort(restart.headUnrealized.root)
-
-  line.add " epoch_error=" & $epochDiag.error
-  line.add " " & fcrBid("epoch_before", epochDiag.before)
-  line.add " " & fcrBid("epoch_after", epochDiag.after)
-  line.add " epoch_p1_too_old=" & $epochDiag.phase1TooOld
-  line.add " epoch_p1_confirmed_ancestor=" & $epochDiag.phase1Ancestor
-  line.add " epoch_p1_too_old_canonical_skip=" &
-    $epochDiag.phase1TooOldCanonicalSkip
-  line.add " epoch_p1_chain_safe_checked=" &
-    $epochDiag.phase1ChainSafeChecked
-  line.add " epoch_p1_chain_safe=" & $epochDiag.phase1ChainSafe
-  line.add " epoch_p1_chain_safe_canonical_skip=" &
-    $epochDiag.phase1ChainSafeCanonicalSkip
-  line.add " epoch_p1_fired=" & $epochDiag.phase1Fired
-  addRestart("epoch", epochDiag.phase2)
-
-  line.add " advance_error=" & $advanceDiag.error
-  line.add " " & fcrBid("advance_before", advanceDiag.before)
-  line.add " " & fcrBid("advance_after", advanceDiag.after)
-  line.add " advance_p1_too_old=" & $advanceDiag.phase1TooOld
-  line.add " advance_p1_confirmed_ancestor=" & $advanceDiag.phase1Ancestor
-  line.add " advance_p1_too_old_canonical_skip=" &
-    $advanceDiag.phase1TooOldCanonicalSkip
-  line.add " advance_p1_fired=" & $advanceDiag.phase1Fired
-  addRestart("advance", advanceDiag.phase2)
-  line.add " advance_p3_gate=" & $advanceDiag.phase3Gate
-  line.add " advance_p3_ran=" & $advanceDiag.phase3Ran
-  line.add " " & fcrBid("advance_p3_before", advanceDiag.phase3Before)
-  line.add " " & fcrBid("advance_p3_after", advanceDiag.phase3After)
-  line.add " advance_p3_changed=" &
-    $(advanceDiag.phase3Before != advanceDiag.phase3After)
-
-  fcrDiagWrite(line)
-  fcrDiagActive = false
-  fcrDiagSimSlot = default(Slot)
-  fcrDiagConfirmedBefore = default(BlockId)
-  fcrDiagEpoch = default(FcrPathDiag)
 
 func init*(
     T: type ForkChoiceBackend, confirmation_byzantine_threshold: uint64,
@@ -417,11 +233,8 @@ proc update_unrealized_justified(self: var ForkChoice, dag: ChainDAGRef) =
 proc reconfirm_fcr(
     self: var ForkChoice, dag: ChainDAGRef,
     confirmed: var BlockId, current_slot: Slot,
-    reason: var string, diag: var FcrDiagnostics,
-    pathDiag: var FcrPathDiag): FcResult[void] =
+    reason: var string, diag: var FcrDiagnostics): FcResult[void] =
   template fcr: ForkChoiceBackend = self.backend
-  pathDiag.ran = true
-  pathDiag.before = confirmed
 
   # Reconfirm with previous balance source after attestations
   # from past slots have been applied
@@ -431,37 +244,21 @@ proc reconfirm_fcr(
     return err ForkChoiceError(
       kind: fcCurrentHeadUnknown,
       blockRoot: fcr.current_slot_head)
-  pathDiag.phase1TooOld = confirmed.slot.epoch + 1 < current_slot.epoch
-  pathDiag.phase1Ancestor = fcrConfirmedAncestorOfHead(headRef, confirmed)
-  pathDiag.phase1ChainSafeChecked = not pathDiag.phase1TooOld
-  let revert = ? fcr.should_revert_confirmed_on_new_epoch(
-    dag, confirmed, current_slot, diag)
-  pathDiag.phase1TooOldCanonicalSkip =
-    revert and pathDiag.phase1TooOld and pathDiag.phase1Ancestor
-  pathDiag.phase1ChainSafeCanonicalSkip =
-    revert and pathDiag.phase1ChainSafeChecked and pathDiag.phase1Ancestor
-  pathDiag.phase1Fired = revert and not pathDiag.phase1Ancestor
-  if pathDiag.phase1ChainSafeChecked:
-    pathDiag.phase1ChainSafe = not revert
-  if pathDiag.phase1Fired:
+  if ? fcr.should_revert_confirmed_on_new_epoch(
+      dag, confirmed, current_slot, diag) and
+      not fcrConfirmedAncestorOfHead(headRef, confirmed):
     reason = "epoch"
     confirmed = fcr.to_block_id(self.checkpoints.finalized)
-    pathDiag.phase1Inc = true
     incSafeEpochReverts()
 
   # Update observed justified checkpoints at the start of an epoch
   self.update_unrealized_justified(dag)
 
   # Restart confirmation chain if necessary
-  pathDiag.phase2 = fcr.fcrRestartDiag(confirmed, current_slot)
-  let restart = ? fcr.should_restart_confirmation_chain(confirmed, current_slot)
-  pathDiag.phase2.result = restart
-  if restart:
+  if ? fcr.should_restart_confirmation_chain(confirmed, current_slot):
     reason = "restart/e"
     confirmed = fcr.observed_justified_block_id
-    pathDiag.phase2Inc = true
     incSafeRestarts()
-  pathDiag.after = confirmed
   ok()
 
 # https://github.com/ethereum/consensus-specs/blob/v1.7.0-alpha.5/specs/phase0/fork-choice.md#on_tick_per_slot
@@ -506,19 +303,13 @@ proc on_tick(
         confirmed = self.backend.confirmed
         reason: string
         diag: FcrDiagnostics
-        pathDiag: FcrPathDiag
-      self.reconfirm_fcr(
-          dag, confirmed, current_slot, reason, diag, pathDiag).isOkOr:
+      self.reconfirm_fcr(dag, confirmed, current_slot, reason, diag).isOkOr:
         warn "Failed to reconfirm 'safe' block - report bug",
           current_slot, reason = error
         reason = "reconfirm"
         confirmed = self.backend.to_block_id(self.checkpoints.finalized)
-        pathDiag.ran = true
-        pathDiag.error = true
-        pathDiag.after = confirmed
         incSafeErrors()
       self.backend.update_confirmed(dag, confirmed, reason, diag)
-      fcrDiagEpoch = pathDiag
 
     else:
       discard
@@ -727,51 +518,35 @@ proc get_head*(
 proc advance_fcr(
     self: var ForkChoice, dag: ChainDAGRef, blckRef: BlockRef,
     confirmed: var BlockId, current_slot: Slot,
-    reason: var string, pathDiag: var FcrPathDiag): FcResult[void] =
+    reason: var string): FcResult[void] =
   template fcr: ForkChoiceBackend = self.backend
-  pathDiag.ran = true
-  pathDiag.before = confirmed
 
-  pathDiag.phase1TooOld = confirmed.slot.epoch + 1 < current_slot.epoch
-  pathDiag.phase1Ancestor = fcrConfirmedAncestorOfHead(blckRef, confirmed)
   let revert = ? fcr.should_revert_confirmed_on_new_head(
     blckRef, confirmed, current_slot)
-  pathDiag.phase1TooOldCanonicalSkip =
-    revert and pathDiag.phase1TooOld and pathDiag.phase1Ancestor
-  pathDiag.phase1Fired = revert and not pathDiag.phase1TooOldCanonicalSkip
-  if pathDiag.phase1Fired:
+  let tooOldCanonical =
+    confirmed.slot.epoch + 1 < current_slot.epoch and
+    fcrConfirmedAncestorOfHead(blckRef, confirmed)
+  if revert and not tooOldCanonical:
     reason = "head"
     confirmed = fcr.to_block_id(self.checkpoints.finalized)
-    pathDiag.phase1Inc = true
     incSafeHeadReverts()
 
-  pathDiag.phase2 = fcr.fcrRestartDiag(confirmed, current_slot)
-  let restart = ? fcr.should_restart_confirmation_chain(confirmed, current_slot)
-  pathDiag.phase2.result = restart
-  if restart:
+  if ? fcr.should_restart_confirmation_chain(confirmed, current_slot):
     reason = "restart/h"
     confirmed = fcr.observed_justified_block_id
-    pathDiag.phase2Inc = true
     incSafeRestarts()
 
   # Attempt to further advance the latest confirmed block.
-  pathDiag.phase3Gate = confirmed.slot.epoch + 1 >= current_slot.epoch
-  pathDiag.phase3Before = confirmed
-  pathDiag.phase3After = confirmed
-  if pathDiag.phase3Gate:
-    pathDiag.phase3Ran = true
+  if confirmed.slot.epoch + 1 >= current_slot.epoch:
     template justified: Checkpoint = self.checkpoints.justified.checkpoint
     let unrealized = fcr.proto_array.unrealized_justified(justified)
     confirmed = ? fcr.find_latest_confirmed_descendant(
       dag, blckRef, unrealized, confirmed, current_slot)
-    pathDiag.phase3After = confirmed
-  pathDiag.after = confirmed
   ok()
 
 proc will_select_head*(
     self: var ForkChoice, dag: ChainDAGRef,
     blckRef: BlockRef, wallTime: BeaconTime): FcResult[void] =
-  let diagBeforeUpdateTime = self.backend.confirmed
   ? self.update_time(dag, wallTime)
   let
     current_slot = self.checkpoints.time.slotOrZero(dag.timeParams)
@@ -783,22 +558,13 @@ proc will_select_head*(
   var
     confirmed = self.backend.confirmed
     reason: string
-    pathDiag: FcrPathDiag
-    errorInc = false
-  self.advance_fcr(
-      dag, blckRef, confirmed, current_slot, reason, pathDiag).isOkOr:
+  self.advance_fcr(dag, blckRef, confirmed, current_slot, reason).isOkOr:
     warn "Failed to advance 'safe' block - report bug",
       blckRef, current_slot, reason = error
     reason = "advance"
     confirmed = self.backend.to_block_id(self.checkpoints.finalized)
-    pathDiag.ran = true
-    pathDiag.error = true
-    pathDiag.after = confirmed
-    errorInc = true
     incSafeErrors()
   self.backend.update_confirmed(dag, confirmed, reason)
-  self.emitFcrDiag(
-    current_slot, diagBeforeUpdateTime, pathDiag, reason, errorInc)
   ok()
 
 # https://github.com/ethereum/consensus-specs/blob/v1.7.0-alpha.5/fork_choice/safe-block.md#get_safe_execution_block_hash

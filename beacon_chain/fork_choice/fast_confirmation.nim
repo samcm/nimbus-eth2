@@ -556,48 +556,23 @@ func is_confirmed_chain_safe(
     # after the balance source gets updated via update_unrealized_justified
     self.previous_epoch_greatest_unrealized_checkpoint
 
-  let confirmed = dag.getBlockRef(confirmed.root).valueOr:
-    return err ForkChoiceError(
-      kind: fcConfirmedNodeUnknown,
-      blockRoot: confirmed.root)
-
-  var is_current_justified_ancestor = false
-  block:
-    var blck = confirmed
-    while blck != nil:
-      if blck.root == current_epoch_justified.root:
-        is_current_justified_ancestor = true
-        break
-      blck = blck.parent
-
-  # Check if the confirmed.root is descendant of
-  # current_epoch_observed_justified.checkpoint.
-  if not is_current_justified_ancestor:
-    return ok false
-
   # Exclude the justified checkpoint block if it is from the previous epoch
   # as then this block will always be canonical in this case.
   # Otherwise: Limit reconfirmation to the first block of the previous epoch
   # as if it's successful, reconfirmation of the ancestors is implied.
-  let current_epoch = current_slot.epoch
-  var confirmation_start =
-    if current_epoch_justified.epoch + 1 >= current_epoch:
-      BlockId(
-        slot: current_epoch_justified.epoch.start_slot,
-        root: current_epoch_justified.root)
-    else:
-      let prev_epoch_start = (max(current_epoch, 1.Epoch) - 1).start_slot
-      var ancestor = confirmed.get_ancestor(prev_epoch_start)
-      if ancestor == nil:
-        return ok false
-      if ancestor.slot.epoch + 1 == current_epoch:
-        ancestor = ancestor.parent
-        if ancestor == nil:
-          return ok false
-      ancestor.bid
+  let
+    confirmed = dag.getBlockRef(confirmed.root).valueOr:
+      return err ForkChoiceError(
+        kind: fcConfirmedNodeUnknown,
+        blockRoot: confirmed.root)
+    current_justified = BlockId(
+      slot: current_epoch_justified.epoch.start_slot,
+      root: current_epoch_justified.root)
+    chain = self.get_ancestor_support_by_slot(
+      balance_source, dag.heads, confirmed, current_justified, current_slot)
 
-  let chain = self.get_ancestor_support_by_slot(
-    balance_source, dag.heads, confirmed, confirmation_start, current_slot)
+  # Check if the confirmed.root is descendant of
+  # current_epoch_observed_justified.checkpoint.
   if chain.len == 0:
     return ok false
 
